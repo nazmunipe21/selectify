@@ -74,3 +74,5 @@ python-dotenv==1.0.0
 langchain-experimental
 langchain-community
 langchain-google-genai
+# Optional utilities
+tabulate==0.9.0
