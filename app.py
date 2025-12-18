@@ -7,6 +7,7 @@ import re
 from tempfile import NamedTemporaryFile
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.optimize import linprog
 
 # LangChain Imports
 from langchain_experimental.agents import create_csv_agent
@@ -54,6 +55,167 @@ load_dotenv()
 # Get Google API key from environment
 import os
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+
+
+# ============================================================================
+# BWM (Best-Worst Method) Solver for MCDM (Multi-Criteria Decision Making)
+# ============================================================================
+
+class BWM:
+    """
+    Best-Worst Method solver (linear programming formulation).
+    Usage:
+      solver = BWM(criteria_list)
+      w, xi = solver.solve(best_idx, worst_idx, a_B, a_W)
+    where:
+      - criteria_list: list of criteria names
+      - best_idx, worst_idx: indices of best and worst in criteria_list
+      - a_B: list/array of length n with a_{Bj} (a_B[best_idx] should be 1)
+      - a_W: list/array of length n with a_{jW} (a_W[worst_idx] should be 1)
+    Returns:
+      - w: normalized weight vector (sums to 1)
+      - xi: consistency measure (smaller is better; ≤0.1 is good)
+    """
+    def __init__(self, criteria):
+        self.criteria = list(criteria)
+        self.n = len(self.criteria)
+
+    def solve(self, best_idx, worst_idx, a_B, a_W, tol=1e-8):
+        """
+        Solve BWM using linear programming to minimize inconsistency ξ.
+        """
+        n = self.n
+        # Validate lengths
+        a_B = np.asarray(a_B, dtype=float).reshape(n)
+        a_W = np.asarray(a_W, dtype=float).reshape(n)
+
+        # Variables: [w_0 ... w_{n-1}, xi]  -> total n+1 variables
+        # Objective: minimize xi -> c = [0,...,0, 1]
+        c = np.zeros(n + 1)
+        c[-1] = 1.0
+
+        # Constraints: we will create 2*n inequalities from absolute values:
+        # For each j:
+        #   w_B - a_Bj * w_j <= xi
+        #  -w_B + a_Bj * w_j <= xi  (i.e. a_Bj*w_j - w_B <= xi)
+        #   w_j - a_jW * w_W <= xi
+        #  -w_j + a_jW * w_W <= xi
+        #
+        # Put them in the form A_ub x <= b_ub, where x = [w..., xi]
+
+        A = []
+        b = []
+
+        # helpers indices
+        xi_idx = n
+        # Loop j
+        for j in range(n):
+            # w_B - a_Bj * w_j - xi <= 0  ==> w_B - a_Bj*w_j - xi <= 0
+            row = np.zeros(n + 1)
+            row[best_idx] = 1.0
+            row[j] = -a_B[j]
+            row[xi_idx] = -1.0
+            A.append(row); b.append(0.0)
+
+            # -w_B + a_Bj*w_j - xi <= 0
+            row = np.zeros(n + 1)
+            row[best_idx] = -1.0
+            row[j] = a_B[j]
+            row[xi_idx] = -1.0
+            A.append(row); b.append(0.0)
+
+            # w_j - a_jW * w_W - xi <= 0
+            row = np.zeros(n + 1)
+            row[j] = 1.0
+            row[worst_idx] = -a_W[j]
+            row[xi_idx] = -1.0
+            A.append(row); b.append(0.0)
+
+            # -w_j + a_jW * w_W - xi <= 0
+            row = np.zeros(n + 1)
+            row[j] = -1.0
+            row[worst_idx] = a_W[j]
+            row[xi_idx] = -1.0
+            A.append(row); b.append(0.0)
+
+        A = np.vstack(A)
+        b = np.array(b, dtype=float)
+
+        # Equality constraint: sum(w) = 1  -> A_eq x = b_eq
+        A_eq = np.zeros((1, n + 1))
+        A_eq[0, :n] = 1.0
+        b_eq = np.array([1.0])
+
+        # Bounds: w_j >= 0, xi >= 0
+        bounds = [(0.0, None)] * (n + 1)
+
+        # Solve LP
+        res = linprog(c, A_ub=A, b_ub=b, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+
+        if not res.success:
+            raise RuntimeError(f"BWM LP failed: {res.message}")
+
+        w = res.x[:n]
+        xi = res.x[-1]
+
+        # Normalize numerical noise
+        w = np.maximum(w, 0.0)
+        if w.sum() > 0:
+            w = w / w.sum()
+
+        return w, xi
+
+
+def apply_weights_to_suppliers(df, criteria, weights, cost_criteria=None):
+    """
+    Apply BWM weights to supplier DataFrame and rank them.
+    
+    Args:
+        df: DataFrame with supplier rows
+        criteria: list of column names (must be numeric)
+        weights: array-like same length as criteria
+        cost_criteria: set/list of criteria names where lower is better (cost), default empty
+    
+    Returns:
+        - df_out: DataFrame with normalized criteria, weighted score, rank
+        - norm_df: DataFrame with normalized values for each criterion
+    """
+    cost_criteria = set(cost_criteria or [])
+    df_local = df.copy()
+
+    # Ensure numeric
+    for c in criteria:
+        df_local[c] = pd.to_numeric(df_local[c], errors='coerce')
+
+    # Normalize: higher better => (x - min)/(max-min); cost => (max - x)/(max-min)
+    norm_df = pd.DataFrame(index=df_local.index)
+    for c in criteria:
+        col = df_local[c]
+        if col.dropna().empty:
+            norm_df[c] = 0.0
+            continue
+        mn = col.min()
+        mx = col.max()
+        if mx - mn <= 0:
+            norm_df[c] = 1.0  # constant column -> neutral
+        else:
+            if c in cost_criteria:
+                norm_df[c] = (mx - col) / (mx - mn)
+            else:
+                norm_df[c] = (col - mn) / (mx - mn)
+
+    # Weighted score
+    w = np.array(weights).reshape(-1)
+    score = (norm_df[criteria].fillna(norm_df[criteria].mean()) * w).sum(axis=1)
+    df_out = df_local.copy()
+    df_out['_bwm_score'] = score
+    df_out = df_out.sort_values('_bwm_score', ascending=False).reset_index(drop=True)
+    df_out['bwm_rank'] = np.arange(1, len(df_out) + 1)
+    return df_out, norm_df
+
+
+# ============================================================================
+
 
 class CodeUtils:
     """Utility class for code extraction and execution"""
@@ -1326,6 +1488,145 @@ class DataApp:
         # Show dataset overview if dataset is uploaded
         if self.df is not None:
             DataFrameUtils.display_dataframe_info(self.df)
+            
+            # ===== BWM UI Section =====
+            st.markdown("---")
+            st.markdown("## Best-Worst Method (BWM) Supplier Ranking")
+            
+            if st.checkbox("Enable BWM hybrid ranking", value=False):
+                # Auto-detect numeric columns as candidate criteria
+                numeric_cols = self.df.select_dtypes(include=['number']).columns.tolist()
+                if not numeric_cols:
+                    st.warning("No numeric columns detected to use as criteria.")
+                else:
+                    chosen = st.multiselect(
+                        "Choose criteria (numeric columns)", 
+                        numeric_cols, 
+                        default=numeric_cols[:min(5, len(numeric_cols))]
+                    )
+                    if chosen:
+                        cols = list(chosen)
+                        col_indices = {c: i for i, c in enumerate(cols)}
+
+                        # Best & Worst selectors
+                        best = st.selectbox("Select Best criterion (most important)", cols, index=0)
+                        worst = st.selectbox(
+                            "Select Worst criterion (least important)", 
+                            cols, 
+                            index=max(0, len(cols)-1)
+                        )
+
+                        st.markdown("### Fill preference vectors (scale 1–9)")
+                        st.write("Values of 1 mean equal importance. 9 means extreme preference.")
+
+                        # Default vectors (1 for best->best and worst->worst)
+                        a_B = []
+                        a_W = []
+                        cols_ui = cols
+                        
+                        with st.container():
+                            st.markdown("#### Best → Others (a_Bj)")
+                            cols_ab = st.columns(min(3, len(cols_ui)))
+                            for idx, c in enumerate(cols_ui):
+                                default = 1 if c == best else 3
+                                col_widget = cols_ab[idx % len(cols_ab)]
+                                a_B.append(
+                                    col_widget.slider(
+                                        f"a_B → {c}", 
+                                        min_value=1, 
+                                        max_value=9, 
+                                        value=int(default), 
+                                        key=f"ab_{c}"
+                                    )
+                                )
+
+                            st.markdown("#### Others → Worst (a_jW)")
+                            cols_aw = st.columns(min(3, len(cols_ui)))
+                            for idx, c in enumerate(cols_ui):
+                                default = 1 if c == worst else 3
+                                col_widget = cols_aw[idx % len(cols_aw)]
+                                a_W.append(
+                                    col_widget.slider(
+                                        f"{c} → a_W", 
+                                        min_value=1, 
+                                        max_value=9, 
+                                        value=int(default), 
+                                        key=f"aw_{c}"
+                                    )
+                                )
+
+                        if st.button("🚀 Solve BWM and Rank Suppliers"):
+                            try:
+                                solver = BWM(cols)
+                                w, xi = solver.solve(col_indices[best], col_indices[worst], a_B, a_W)
+                                st.success("✅ BWM solved successfully!")
+                                
+                                # Display weights
+                                st.markdown("### 📊 Criteria Weights")
+                                weights_df = pd.DataFrame({"Criterion": cols, "Weight": w})
+                                st.dataframe(weights_df, use_container_width=True)
+
+                                # Consistency check
+                                if xi <= 0.1:
+                                    consistency_color = "🟢"
+                                    consistency_text = "Good / Consistent"
+                                elif xi <= 0.2:
+                                    consistency_color = "🟡"
+                                    consistency_text = "Acceptable (with caution)"
+                                else:
+                                    consistency_color = "🔴"
+                                    consistency_text = "Inconsistent — review preferences"
+                                
+                                st.info(
+                                    f"{consistency_color} **Consistency measure ξ = {xi:.4f}**  \n"
+                                    f"Status: {consistency_text}  \n"
+                                    f"(ξ ≤ 0.1 is ideal; ξ ≤ 0.2 is acceptable)"
+                                )
+
+                                # Ask which criteria are cost-type
+                                cost_select = st.multiselect(
+                                    "Select cost-type criteria (lower is better)", 
+                                    cols, 
+                                    default=[]
+                                )
+                                
+                                # Rank suppliers
+                                ranked_df, normalized = apply_weights_to_suppliers(
+                                    self.df, cols, w, cost_criteria=cost_select
+                                )
+
+                                st.markdown("### 🏆 Ranked Suppliers (by BWM weighted score)")
+                                display_cols = ['bwm_rank', '_bwm_score'] + cols
+                                display_cols = [c for c in display_cols if c in ranked_df.columns]
+                                st.dataframe(
+                                    ranked_df[display_cols].head(20), 
+                                    use_container_width=True
+                                )
+
+                                # Visualize weights
+                                fig = px.bar(
+                                    weights_df, 
+                                    x='Criterion', 
+                                    y='Weight', 
+                                    title="📈 BWM Criteria Weights",
+                                    labels={"Weight": "Normalized Weight"}
+                                )
+                                fig.update_layout(height=400)
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Option to download results
+                                csv = ranked_df.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Ranked Results (CSV)",
+                                    data=csv,
+                                    file_name="bwm_ranked_suppliers.csv",
+                                    mime="text/csv"
+                                )
+
+                            except Exception as e:
+                                st.error(f"❌ BWM failed: {str(e)}")
+                                st.info("Please check your preference values and try again.")
+
         
         # Display status information if setup is incomplete
         if not uploaded_file and not google_api_key:
