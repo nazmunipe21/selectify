@@ -112,29 +112,29 @@ class BWM:
         for j in range(n):
             # w_B - a_Bj * w_j - xi <= 0  ==> w_B - a_Bj*w_j - xi <= 0
             row = np.zeros(n + 1)
-            row[best_idx] = 1.0
-            row[j] = -a_B[j]
+            row[best_idx] += 1.0
+            row[j] -= a_B[j]
             row[xi_idx] = -1.0
             A.append(row); b.append(0.0)
 
             # -w_B + a_Bj*w_j - xi <= 0
             row = np.zeros(n + 1)
-            row[best_idx] = -1.0
-            row[j] = a_B[j]
+            row[best_idx] -= 1.0
+            row[j] += a_B[j]
             row[xi_idx] = -1.0
             A.append(row); b.append(0.0)
 
             # w_j - a_jW * w_W - xi <= 0
             row = np.zeros(n + 1)
-            row[j] = 1.0
-            row[worst_idx] = -a_W[j]
+            row[j] += 1.0
+            row[worst_idx] -= a_W[j]
             row[xi_idx] = -1.0
             A.append(row); b.append(0.0)
 
             # -w_j + a_jW * w_W - xi <= 0
             row = np.zeros(n + 1)
-            row[j] = -1.0
-            row[worst_idx] = a_W[j]
+            row[j] -= 1.0
+            row[worst_idx] += a_W[j]
             row[xi_idx] = -1.0
             A.append(row); b.append(0.0)
 
@@ -804,7 +804,7 @@ This framework ensures natural, helpful data analysis responses that match the u
             
         try:
             self.google_chat = ChatGoogleGenerativeAI(
-                model="gemini-flash-lite-latest",
+                model="gemini-3-flash-preview",
                 google_api_key=self.google_api_key,
                 temperature=0.7,
                 max_tokens=None,
